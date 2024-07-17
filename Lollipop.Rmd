@@ -1,0 +1,509 @@
+---
+title: "SNP Visualization"
+output: html_notebook
+---
+SNP Visualization: This R script visualizes SNP data from the gnomAD website. The three graphs shows 
+1.the relative location of the parental gene of the ORF of interest
+2.relative location of SNPs and ORFs, including the ORF of interest, on the parental gene
+3.the specific DNA sequences of the exons of the ORF of interest corresponding to the SNPs
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("ensembldb", force = T)
+install.packages("locuszoomr")
+BiocManager::install("AnnotationHub")
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(AnnotationHub)
+library(locuszoomr)
+library(biomaRt)
+library(patchwork)
+install.packages("ggbreak")
+library(ggbreak) 
+library(ensembldb)
+library("Biostrings")
+
+#Load ensembl data
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+ah <- AnnotationHub()
+query(ah, c("EnsDb", "Homo sapiens"))
+ensDb_v106 <- ah[["AH100643"]]
+```
+
+The zoom_out_track function graphs the parental gene of the ORF of interest and its surrounding genes
+Input: 
+- Name of the specific ORF of a lncRNA from the Ribo-seq_ORFs.csv file 
+
+Output: 
+- Gene tracks of the parental gene and other genes within 100,000 base pairs of the parental gene with genomic position as the X-axis
+- The parental gene is colored red
+
+```{r}
+
+zoom_out_tracks <- function(orf_name){
+  gene_name <- orf %>%
+    filter(name2 == orf_name) %>%
+    pull(geneName2)
+  test_position <- data.frame(chromosome = lollipop$chrom, position = lollipop$pos, p = lollipop$AF, rsId = lollipop$orf_id)
+  
+  loci <- locuszoomr::locus(data = test_position, gene = gene_name, flank = 1e5, ens_db = ensDb_v106)
+  locuszoomr::genetracks(loci, highlight = gene_name)
+}
+
+```
+
+The track_with_snp function creates a lollipop plot of the SNPs in all the ORFs in the parental gene of the orf of interest. It is placed on top of the gene track of the parental gene
+Input: 
+- Name of the specific ORF of a lncRNA from the Ribo-seq_ORFs.csv file 
+
+Output: 
+- Lollipop plot of the SNPs downloaded from gnomAD with the allele frequency as the Y-axis and genomic position as the X-axis. The SNPs are distinguished by different colors based on their classification as SNV, insertion, deletion, duplication, delin, or other
+- The exons of the ORF of interest is indicated by tall black boxes while the exons of other ORFs in the parental gene is indicated by small black boxes below the X-axis
+- The gene track of the parental gene is directly below the lollipop plot
+
+```{r}
+
+track_with_snp <- function(orf_name){ 
+  gene_name <- orf %>%
+    filter(name2 == orf_name) %>%
+    pull(geneName2)
+  gene_symbol <- gene_name
+
+  # Retrieve genomic coordinates for the gene
+  gene_coordinates <- getBM(
+      attributes = c("ensembl_gene_id", "external_gene_name", "chromosome_name", "start_position", "end_position"),
+      filters = "hgnc_symbol",
+      values = gene_symbol,
+      mart = ensembl
+  )
+  
+  gene_start <- as.numeric(gene_coordinates$start_position)
+  gene_end <- as.numeric(gene_coordinates$end_position)
+  
+  linc_orf <- orf[orf$geneName2 == gene_name, ]
+
+  rect <- data.frame(chromstart = linc_orf$chromStart, count = linc_orf$blockCount, size = linc_orf$blockSizes, start = linc_orf$blockStart)
+  
+  # Convert size and start columns to numeric vectors
+  orf_df <- rect %>%
+    mutate(size = map(strsplit(as.character(size), ","), function(x) as.numeric(x)),
+           start = map(strsplit(as.character(start), ","), function(x) as.numeric(x)))
+  
+  # Function to create multiple columns based on count
+  create_orf_columns <- function(chromstart, count, start, size) {
+    # Initialize empty list to store results
+    results <- list()
+    
+    # Loop over each count
+    for (i in seq_len(count)) {
+      # Calculate orfstart and orfend for each count
+      orfstart <- chromstart + start[i]
+      orfend <- chromstart + start[i] + size[i]
+      
+      # Store results in a list
+      results[[paste0("orfstart", i)]] <- orfstart
+      results[[paste0("orfend", i)]] <- orfend
+    }
+    
+    # Return the results as a data frame
+    return(as.data.frame(results))
+  }
+  
+
+  
+  # Apply the function row-wise using pmap from purrr
+  orf_df <- bind_cols(orf_df, pmap_df(orf_df, create_orf_columns))
+  orf_df$name <- linc_orf$name
+  orf_df <- orf_df %>%
+    mutate(ymax = ifelse(!is.null(orf_name) & name == orf_name, Inf, 0))
+  orf_df$chromEnd <- linc_orf$chromEnd
+  
+  iterations <- 8 - orf_df$count
+    
+  for (i in (orf_df$count + 1):iterations) {
+    orf_df[[paste0("orfstart", i)]] <- 0
+    orf_df[[paste0("orfend", i)]] <- 0
+  }
+  
+  new <- orf %>%
+    filter(geneName2 == gene_name) %>%
+    pull(geneName)
+  
+  filtered_lollipop <- lollipop %>%
+    filter(gene_id == new)
+  
+  test <- data.frame(position = filtered_lollipop$pos, frequency = filtered_lollipop$AF, consequence = filtered_lollipop$HGVS)
+
+  # Classify the consequences
+  test <- test %>%
+    mutate(variant_class = case_when(
+      grepl(">", consequence) ~ "SNV",
+      grepl("del", consequence) ~ "deletion",
+      grepl("ins", consequence) ~ "insertion",
+      grepl("dup", consequence) ~ "duplication",
+      TRUE ~ "other"  # In case there are other types not specified
+    ))
+  
+  # Define a color palette for the different variant classes
+  variant_colors <- c("SNV" = "blue", 
+                      "deletion" = "red", 
+                      "insertion" = "green", 
+                      "duplication" = "orange", 
+                      "other" = "purple")
+  
+  variant_plot <- ggplot(test, aes(x=position, y=frequency, color = variant_class)) +
+    geom_segment(aes(x=position, xend=position, y=0, yend=frequency), color="grey") +
+    geom_point(size=2) +
+    scale_color_manual(values = variant_colors) +
+    theme_light() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "top"
+    ) +
+    ggtitle(paste("Variant Frequencies of ", gene_name)) +
+    ylab("Allele Frequency") +
+    xlim(gene_start, gene_end)
+  
+  variant_plot_carpet <- variant_plot + 
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart1, xmax = orfend1, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart2, xmax = orfend2, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart3, xmax = orfend3, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart4, xmax = orfend4, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart5, xmax = orfend5, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart6, xmax = orfend6, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid")
+
+
+  test_position <- data.frame(chromosome = lollipop$chrom, position = lollipop$pos, p = lollipop$AF, rsId = lollipop$filter)
+  loc <- locus(data = test_position, gene = gene_name, fix_window = gene_end - gene_start,
+             ens_db = ensDb_v106)
+  grid.arrange(variant_plot_carpet, genetracks(loc, filter_gene_name = gene_name), nrow = 2, heights = c(1, 1))
+}
+
+```
+
+The zoom_in_snp function creates a lollipop plot of the SNPs in the ORF of interest with a carpet plot of the corresponding DNA sequence
+Input: 
+- Name of the specific ORF of a lncRNA from the Ribo-seq_ORFs.csv file 
+
+Output: 
+- Lollipop plot of the SNPs in the ORF of interest with the allele frequency as the Y-axis and genomic position as the X-axis. The SNPs are distinguished by different colors based on their classification as SNV, insertion, deletion, duplication, delin, or other
+- The exons of the ORF of interest is indicated by tall black boxes. The introns are left out of the graph
+- A carpet plot of the corresponding DNA sequence of the exons is directly under the X-axis. Different nucleotides are represented by different colors
+
+```{r}
+
+zoom_in_snp <- function(orf_name){
+  gene_name <- orf %>%
+    filter(name2 == orf_name) %>%
+    pull(geneName2)
+  
+  ensembl_name <-  orf %>%
+    filter(name2 == orf_name) %>%
+    pull(geneName)
+
+  
+  filtered_lollipop <- lollipop %>%
+    filter(gene_id %in% ensembl_name)
+  test <- data.frame(position = filtered_lollipop$pos, frequency = filtered_lollipop$AF, consequence = filtered_lollipop$HGVS)
+
+  # Classify the consequences
+  test <- test %>%
+    mutate(variant_class = case_when(
+      grepl(">", consequence) ~ "SNV",
+      grepl("del", consequence) ~ "deletion",
+      grepl("ins", consequence) ~ "insertion",
+      grepl("dup", consequence) ~ "duplication",
+      TRUE ~ "other"  # In case there are other types not specified
+    ))
+  
+  # Define a color palette for the different variant classes
+  variant_colors <- c("SNV" = "blue", 
+                      "deletion" = "red", 
+                      "insertion" = "green", 
+                      "duplication" = "orange", 
+                      "other" = "purple")
+  
+  linc_orf <- orf[orf$geneName2 == gene_name, ]
+
+  rect <- data.frame(chromstart = linc_orf$chromStart, count = linc_orf$blockCount, size = linc_orf$blockSizes, start = linc_orf$blockStart)
+  
+  # Convert size and start columns to numeric vectors
+  orf_df <- rect %>%
+    mutate(size = map(strsplit(as.character(size), ","), function(x) as.numeric(x)),
+           start = map(strsplit(as.character(start), ","), function(x) as.numeric(x)))
+  
+  # Function to create multiple columns based on count
+  create_orf_columns <- function(chromstart, count, start, size) {
+    # Initialize empty list to store results
+    results <- list()
+    
+    # Loop over each count
+    for (i in seq_len(count)) {
+      # Calculate orfstart and orfend for each count
+      orfstart <- chromstart + start[i]
+      orfend <- chromstart + start[i] + size[i]
+      
+      # Store results in a list
+      results[[paste0("orfstart", i)]] <- orfstart
+      results[[paste0("orfend", i)]] <- orfend
+    }
+    
+    # Return the results as a data frame
+    return(as.data.frame(results))
+  }
+  
+  # Apply the function row-wise using pmap from purrr
+  orf_df <- bind_cols(orf_df, pmap_df(orf_df, create_orf_columns))
+  orf_df$name <- linc_orf$name
+  orf_df <- orf_df %>%
+    mutate(ymax = ifelse(name == orf_name, Inf, 0))
+  orf_df$chromEnd <- linc_orf$chromEnd
+  
+  iterations <- 8 - orf_df$count
+    
+  for (i in (orf_df$count + 1):iterations) {
+    orf_df[[paste0("orfstart", i)]] <- 0
+    orf_df[[paste0("orfend", i)]] <- 0
+  }
+  
+  filtered_df <- orf_df %>% filter(name == orf_name)
+  xmin <- min(filtered_df$chromstart)
+  xmax <- max(filtered_df$chromEnd)
+  
+  variant_sizes <- c("SNV" = 2, 
+                      "deletion" = 4, 
+                      "insertion" = 4, 
+                      "duplication" = 2, 
+                      "other" = 2)
+  
+
+  filtered_row <- df[df$seq_name == orf_name, ]
+
+  
+  dna_df <- data.frame(Position = 1:nchar(filtered_row$sequence),
+                           Nucleotide = strsplit(filtered_row$sequence, "")[[1]])
+  
+  sequences <- list()
+  
+  for (i in 1:filtered_df$count) {
+    start_col <- paste0("orfstart", i)
+    end_col <- paste0("orfend", i)
+    sequences[[i]] <- seq(from = filtered_df[[start_col]] + 1, to = filtered_df[[end_col]], by = 1)
+  }
+  
+  # Combine both sequences
+  position <- unlist(sequences)
+
+    # Create a data frame with the position column
+
+  dna_df$Position <- dna_df$Position + xmin
+  dna_df <- dna_df[dna_df$Position %in% position, ]
+  
+  nucleotides <- unique(dna_df$Nucleotide)
+  colors <- rainbow(length(nucleotides))
+  names(colors) <- nucleotides
+  
+  zoom_plot <- ggplot(test, aes(x=position, y=frequency, color = variant_class)) +
+    geom_segment(aes(x=position, xend=position, y=0, yend=frequency), color="grey") +
+    geom_point(aes(size=variant_class)) +
+    scale_color_manual(values = variant_colors) +
+    scale_size_manual(values = variant_sizes) +
+    theme_light() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "top"
+    ) +
+    ggtitle(paste("Variant Frequencies of ", orf_name)) +
+    ylab("Allele Frequency") +
+    xlim(xmin, xmax + 1) +
+    geom_rect(data = dna_df, aes(xmin = Position - 0.5, xmax = Position + 0.5, ymin = -Inf, ymax = 0, fill = Nucleotide), color = "black", inherit.aes = FALSE) +  # rectangles below x-axis
+    scale_fill_manual(values = colors) # fill colors for rectangles
+
+  zoom_plot <- zoom_plot + 
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart1, xmax = orfend1, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart2, xmax = orfend2, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart3, xmax = orfend3, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart4, xmax = orfend4, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart5, xmax = orfend5, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart6, xmax = orfend6, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid")
+  
+    
+  breaks <- list()
+  num_orfs <- filtered_df$count
+  
+  # Loop through each ORF except the last one
+  for (i in 1:(num_orfs - 1)) {
+    breaks[[length(breaks) + 1]] <- filtered_df[[paste0("orfend", i)]] + 1
+    breaks[[length(breaks) + 1]] <- filtered_df[[paste0("orfstart", i + 1)]] - 1
+  }
+
+  zoom_plot <- zoom_plot + scale_x_break(unlist(breaks))
+  return(zoom_plot)
+  
+}#Add // symbol at break
+
+```
+
+---------Main---------------
+0. Install and call all the packages at the start of the script
+1. Run through the code to load necessary lncRNA, SNP, and sequence data
+2. Specify your ORF of interest and call the functions zoom_out_tracks, track_with_snp, and zoom_in_snp to visualize the SNP data
+
+```{r}
+#-----------------------------------Load lncRNA data and name the columns------------------------------------------------
+orf <- read.csv("Ribo-seq_ORFs.csv", header = F, sep = "\t")
+names <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand", "thickStart", "thickEnd", "itemRgb", "blockCount", "blockSizes", "blockStart", "name2", "cdsStartStat", "cdsEndStat", "exonFrames", "type", "geneName", "geneName2", "geneType", "transcript_biotype", "proteinSequence", "all_transcript_ids", "all_gene_ids", "replicated", "ref_studies")
+colnames(orf) <- names
+
+
+#-----------------------------------Load SNP data and add column called HGVS that classifies the SNPs--------------------
+lollipop <- read.csv("variants_gencode_orfs.csv")
+
+create_hgvs <- function(seqname, start, ref, alt) {
+  if (nchar(ref) == 1 && nchar(alt) == 1) {
+    # SNV
+    return(paste0(seqname, ":c.", start, ref, ">", alt))
+  } else if (nchar(ref) == 1 && nchar(alt) > 1) {
+    # Insertion
+    return(paste0(seqname, ":c.", start, "_", as.numeric(start) + 1, "ins", alt))
+  } else if (nchar(ref) > 1 && nchar(alt) == 1) {
+    # Deletion
+    if (nchar(ref) == 1) {
+      return(paste0(seqname, ":c.", start, "del"))
+    } else {
+      return(paste0(seqname, ":c.", start, "_", as.numeric(start) + nchar(ref) - 1, "del"))
+    }
+  } else if (nchar(ref) > 1 && nchar(alt) > 1 && ref != alt) {
+    # Indel
+    return(paste0(seqname, ":c.", start, "_", as.numeric(start) + nchar(ref) - 1, "delins", alt))
+  } else if (ref == alt) {
+    # Duplication
+    if (nchar(ref) == 1) {
+      return(paste0(seqname, ":c.", start, "dup"))
+    } else {
+      return(paste0(seqname, ":c.", start, "_", as.numeric(start) + nchar(ref) - 1, "dup"))
+    }
+  } else {
+    return(NA)
+  }
+}
+
+lollipop$HGVS <- apply(lollipop, 1, function(row) {
+  create_hgvs(row["chrom"], row["pos"], row["ref"], row["alt"])
+})
+
+
+#-----------------------------------Load sequence data of each lncRNA orf and remove extra information from the first column-----------------------
+fastaFile <- readDNAStringSet("Ribo-seq_ORFs.fa")
+seq_name = names(fastaFile)
+sequence = paste(fastaFile)
+df <- data.frame(seq_name, sequence)
+df$seq_name <- sub(":.*", "", df$seq_name)
+
+
+#-----------------------------------Call the functions to graph the plots---------------------------------------
+zoom_out_tracks("c9riboseqorf37")
+track_with_snp("c9riboseqorf37")
+zoom_in_snp("c2norep147")
+
+
+
+
+orf_name <- "c1norep1"
+  ref_genome <- BSgenome.Hsapiens.UCSC.hg38
+  txdb <- makeTxDbFromUCSC(genome = "hg38", tablename = "refGene")
+  coding <- predictCoding(snps, txdb, ref_genome, varAllele = lollipop$alt)
+
+
+snps <- VRanges(seqnames = lollipop$chr,
+                ranges = IRanges(start = lollipop$pos, end = lollipop$pos),
+                ref = lollipop$ref,
+                alt = lollipop$alt)
+  seqlevelsStyle(snps) <- "UCSC"
+  param <- ScanVcfParam(info = "sdf", geno = "dsf", samples = "dfs", fixed = "ALT")
+  vcf <- VariantAnnotation::readVcf(vcfFile = snps, genome = ref_genome, param = param)
+  seqlevelsStyle(vcf) <- "UCSC"
+  
+
+```
+
+Test -> Trying to download sequence data from Ensembl if fasta file is not available
+
+```{r}
+gene_symbol <- "LINC01128"  # Replace with your gene of interest
+
+# Use the Ensembl BioMart to fetch the gene sequence
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get all exons of all transcripts for the gene
+gene_sequence <- getSequence(id = gene_symbol,
+                             type = "hgnc_symbol",
+                             seqType = "gene_exon",
+                             mart = mart)
+
+
+# Combine all sequences (in case the gene has multiple transcripts)
+dna_sequence <- paste(gene_sequence$gene_exon, collapse = "")
+
+#Get all transcripts
+transcripts <- getBM(
+  attributes = c('ensembl_transcript_id', 'transcript_biotype', 'transcript_start', 'transcript_end', 'transcript_length'),
+  filters = 'hgnc_symbol',
+  values = gene_symbol,
+  mart = mart
+)
+
+# Filter to select only the principal transcript (you may need to adjust this based on your criteria)
+# Here, we are selecting the longest transcript as a proxy for the principal transcript
+principal_transcript <- transcripts[which.max(transcripts$transcript_length), 'ensembl_transcript_id']
+
+# Get the exon sequences for the principal transcript
+exon_sequences <- getSequence(
+  id = principal_transcript,
+  type = "ensembl_transcript_id",
+  seqType = "gene_exon",
+  mart = mart
+)
+```
+
+--Victor Wang 2024/7/16 :D
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
