@@ -2,10 +2,11 @@
 title: "SNP Visualization"
 output: html_notebook
 ---
-SNP Visualization: This R script visualizes SNP data from the gnomAD website. The three graphs shows 
-1.the relative location of the parental gene of the ORF of interest
-2.relative location of SNPs and ORFs, including the ORF of interest, on the parental gene
-3.the specific DNA sequences of the exons of the ORF of interest corresponding to the SNPs
+SNP Visualization: This R script visualizes SNP data from the gnomAD website. The four graphs shows 
+1.The relative location of the parental gene of the ORF of interest
+2.Relative location of SNPs and ORFs, including the ORF of interest, on the parental gene
+3.The specific DNA sequences of the exons of the ORF of interest corresponding to the SNPs
+4.Protein consequence and strand direction if further SNP data is provided
 
 ```{r}
 if (!requireNamespace("BiocManager", quietly = TRUE))
@@ -57,7 +58,7 @@ zoom_out_tracks <- function(orf_name){
 
 ```
 
-The track_with_snp function creates a lollipop plot of the SNPs in all the ORFs in the parental gene of the orf of interest. It is placed on top of the gene track of the parental gene
+The track_with_snp function creates a lollipop plot of the SNPs in all the ORFs in the parental gene of the ORF of interest. It is placed on top of the gene track of the parental gene
 Input: 
 - Name of the specific ORF of a lncRNA from the Ribo-seq_ORFs.csv file 
 
@@ -364,7 +365,7 @@ zoom_in_snp <- function(orf_name){
   breaks <- list()
   num_orfs <- filtered_df$count
   
-  # Loop through each ORF except the last one
+  # Loop through each ORF
   for (i in 1:(num_orfs - 1)) {
     breaks[[length(breaks) + 1]] <- filtered_df[[paste0("orfend", i)]] + 1
     breaks[[length(breaks) + 1]] <- filtered_df[[paste0("orfstart", i + 1)]] - 1
@@ -373,7 +374,226 @@ zoom_in_snp <- function(orf_name){
   zoom_plot <- zoom_plot + scale_x_break(unlist(breaks))
   return(zoom_plot)
   
-}#Add // symbol at break
+}
+
+```
+
+The protein_consequence function creates a lollipop plot of the protein consequence of the SNPs in the ORF of interest with a carpet plot of the corresponding DNA sequence. It also indicates the strand direction of the ORF
+Input: 
+- Name of the specific ORF of a lncRNA from the Ribo-seq_ORFs.csv file
+- File with saved SNP consequence in variable called test
+
+Output: 
+- Lollipop plot of the SNPs in the ORF of interest with its severity as the Y-axis and genomic position as the X-axis. The SNPs are distinguished by different colors based on their protein consequence as missense_variant, stop_lost, synonymous_variant, frameshift_variant, and nonsense_variant
+- The exons of the ORF of interest is indicated by tall black boxes. The introns are left out of the graph
+- A carpet plot of the corresponding DNA sequence of the exons is directly under the X-axis. Different nucleotides are represented by different colors
+- The strand direction is indicated using an arrow between the MODIFIER and LOW locations on the Y-axis
+
+```{r}
+
+protein_consequence <- function(orf_name){
+  gene_name <- orf %>%
+    filter(name2 == orf_name) %>%
+    pull(geneName2)
+
+  filtered_test <- test %>%
+    filter(V4 %in% orf_name)
+  filtered_test <- filtered_test %>%
+    mutate(V2 = if_else(str_detect(V2, "-"),
+                             str_extract(V2, "(?<=:)[0-9]+(?=-)"),
+                             str_extract(V2, "(?<=:)[0-9]+")))
+  filtered_test$V2 <- as.numeric(filtered_test$V2)
+  filtered_test <- filtered_test %>%
+    mutate(impact = str_extract(V14, "(?<=IMPACT=)[^;]+"))
+  filtered_test <- filtered_test %>%
+    mutate(strand = str_extract(V14, "(?<=STRAND=)[^;]+"))
+  filtered_test <- data.frame(position = filtered_test$V2, orf_name = filtered_test$V4, Consequence = filtered_test$V7, impact = filtered_test$impact, strand = filtered_test$strand)
+  
+  impact_mapping <- c(
+    "MODIFIER" = 0,
+    "Strand Direction" = 0.5,
+    "LOW" = 1,
+    "MODERATE" = 2,
+    "HIGH" = 3
+  )
+  filtered_test$impact_numeric <- impact_mapping[filtered_test$impact]
+
+
+  
+  # Define a color palette for the different variant classes
+  variant_colors <- c("missense_variant" = "red", 
+                      "stop_lost" = "orange", 
+                      "synonymous_variant" = "green",
+                      "frameshift_variant" = "blue",
+                      "nonsense_variant" = "purple"
+                      )
+  
+  linc_orf <- orf[orf$geneName2 == gene_name, ]
+
+  rect <- data.frame(chromstart = linc_orf$chromStart, count = linc_orf$blockCount, size = linc_orf$blockSizes, start = linc_orf$blockStart)
+  
+  # Convert size and start columns to numeric vectors
+  orf_df <- rect %>%
+    mutate(size = map(strsplit(as.character(size), ","), function(x) as.numeric(x)),
+           start = map(strsplit(as.character(start), ","), function(x) as.numeric(x)))
+  
+  # Function to create multiple columns based on count
+  create_orf_columns <- function(chromstart, count, start, size) {
+    # Initialize empty list to store results
+    results <- list()
+    
+    # Loop over each count
+    for (i in seq_len(count)) {
+      # Calculate orfstart and orfend for each count
+      orfstart <- chromstart + start[i]
+      orfend <- chromstart + start[i] + size[i]
+      
+      # Store results in a list
+      results[[paste0("orfstart", i)]] <- orfstart
+      results[[paste0("orfend", i)]] <- orfend
+    }
+    
+    # Return the results as a data frame
+    return(as.data.frame(results))
+  }
+  
+  # Apply the function row-wise using pmap from purrr
+  orf_df <- bind_cols(orf_df, pmap_df(orf_df, create_orf_columns))
+  orf_df$name <- linc_orf$name
+  orf_df <- orf_df %>%
+    mutate(ymax = ifelse(name == orf_name, Inf, 0))
+  orf_df$chromEnd <- linc_orf$chromEnd
+  
+  iterations <- 8 - orf_df$count
+    
+  for (i in (orf_df$count + 1):iterations) {
+    orf_df[[paste0("orfstart", i)]] <- 0
+    orf_df[[paste0("orfend", i)]] <- 0
+  }
+  
+  filtered_df <- orf_df %>% filter(name == orf_name)
+  xmin <- min(filtered_df$chromstart)
+  xmax <- max(filtered_df$chromEnd)
+  
+  variant_sizes <- c("missense_variant" = 4, 
+                      "stop_lost" = 4, 
+                      "synonymous_variant" = 2,
+                      "frameshift_variant" = 4
+                      )
+  
+
+  filtered_row <- df[df$seq_name == orf_name, ]
+
+  
+  dna_df <- data.frame(Position = 1:nchar(filtered_row$sequence),
+                           Nucleotide = strsplit(filtered_row$sequence, "")[[1]])
+  
+  sequences <- list()
+  
+  for (i in 1:filtered_df$count) {
+    start_col <- paste0("orfstart", i)
+    end_col <- paste0("orfend", i)
+    sequences[[i]] <- seq(from = filtered_df[[start_col]] + 1, to = filtered_df[[end_col]], by = 1)
+  }
+  
+  # Combine both sequences
+  position <- unlist(sequences)
+
+    # Create a data frame with the position column
+
+  dna_df$Position <- dna_df$Position + xmin
+  dna_df <- dna_df[dna_df$Position %in% position, ]
+  
+  nucleotides <- unique(dna_df$Nucleotide)
+  colors <- rainbow(length(nucleotides))
+  names(colors) <- nucleotides
+  
+  zoom_plot <- ggplot(filtered_test, aes(x=position, y=impact_numeric, color = Consequence)) +
+    geom_segment(aes(x=position, xend=position, y=0, yend=impact_numeric), color="grey") +
+    geom_point(aes(size=Consequence)) +
+    scale_color_manual(values = variant_colors) +
+    scale_y_continuous(breaks = c(0, 0.5, 1, 2, 3), labels = c("MODIFIER", "Strand", "LOW", "MODERATE", "HIGH")) +
+    scale_size_manual(values = variant_sizes) +
+    theme_light() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "top"
+    ) +
+    ggtitle(paste("Variant Consequence of ", orf_name)) +
+    ylab("Impact Level") +
+    xlim(xmin, xmax + 1) +
+    geom_rect(data = dna_df, aes(xmin = Position - 0.5, xmax = Position + 0.5, ymin = -Inf, ymax = 0, fill = Nucleotide), color = "black", inherit.aes = FALSE) +  # rectangles below x-axis
+    scale_fill_manual(values = colors) # fill colors for rectangles +
+
+
+  zoom_plot <- zoom_plot + 
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart1, xmax = orfend1, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart2, xmax = orfend2, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart3, xmax = orfend3, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart4, xmax = orfend4, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart5, xmax = orfend5, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid") +
+    geom_rect(data = orf_df,
+              aes(x = NULL, y = NULL, xmin = orfstart6, xmax = orfend6, ymin = -Inf, ymax = ymax), 
+              fill = NA, color = "black", size = 0.5, linetype = "solid")
+  
+    
+  breaks <- list()
+  num_orfs <- filtered_df$count
+  
+  if (num_orfs > 1) {
+    # Loop through each ORF
+    for (i in 1:(num_orfs - 1)) {
+      breaks[[length(breaks) + 1]] <- filtered_df[[paste0("orfend", i)]] + 1
+      breaks[[length(breaks) + 1]] <- filtered_df[[paste0("orfstart", i + 1)]] - 1
+    }
+    zoom_plot <- zoom_plot + scale_x_break(unlist(breaks))
+  }
+  
+  if (any(filtered_test$strand == 1)) {
+    zoom_plot <- zoom_plot + 
+      geom_segment(
+        aes(
+          x = (xmin + xmax) / 2 - 10,
+          xend = (xmin + xmax) / 2 + 10,
+          y = 0.5,
+          yend = 0.5
+        ),
+        arrow = arrow(type = "closed", length = unit(0.2, "inches")),
+        size = 1,
+        color = "black"
+      )
+  }
+  
+  # Add arrow pointing left if strand is not 1
+  if (any(filtered_test$strand != 1)) {
+    zoom_plot <- zoom_plot + 
+      geom_segment(
+        aes(
+          x = (xmin + xmax) / 2 + 10,
+          xend = (xmin + xmax) / 2 - 10,
+          y = 0.5,
+          yend = 0.5
+        ),
+        arrow = arrow(type = "closed", length = unit(0.2, "inches")),
+        size = 1,
+        color = "black"
+      )
+  }
+    
+  return(zoom_plot)
+}
 
 ```
 
@@ -381,6 +601,7 @@ zoom_in_snp <- function(orf_name){
 0. Install and call all the packages at the start of the script
 1. Run through the code to load necessary lncRNA, SNP, and sequence data
 2. Specify your ORF of interest and call the functions zoom_out_tracks, track_with_snp, and zoom_in_snp to visualize the SNP data
+3. If you have a file with protein consequence, read the file into a data frame and save it to the variable "test". Specify your ORF of interest and call the function proetin_consequence to visualize the protein consequence of the SNPs
 
 ```{r}
 #-----------------------------------Load lncRNA data and name the columns------------------------------------------------
@@ -435,34 +656,16 @@ df$seq_name <- sub(":.*", "", df$seq_name)
 
 
 #-----------------------------------Call the functions to graph the plots---------------------------------------
-zoom_out_tracks("c9riboseqorf37")
-track_with_snp("c9riboseqorf37")
-zoom_in_snp("c2norep147")
-
-
-
-
-orf_name <- "c1norep1"
-  ref_genome <- BSgenome.Hsapiens.UCSC.hg38
-  txdb <- makeTxDbFromUCSC(genome = "hg38", tablename = "refGene")
-  coding <- predictCoding(snps, txdb, ref_genome, varAllele = lollipop$alt)
-
-
-snps <- VRanges(seqnames = lollipop$chr,
-                ranges = IRanges(start = lollipop$pos, end = lollipop$pos),
-                ref = lollipop$ref,
-                alt = lollipop$alt)
-  seqlevelsStyle(snps) <- "UCSC"
-  param <- ScanVcfParam(info = "sdf", geno = "dsf", samples = "dfs", fixed = "ALT")
-  vcf <- VariantAnnotation::readVcf(vcfFile = snps, genome = ref_genome, param = param)
-  seqlevelsStyle(vcf) <- "UCSC"
+zoom_out_tracks("c1riboseqorf1")
+track_with_snp("c1riboseqorf1")
+zoom_in_snp("c1riboseqorf1")
   
+#-----------------------------------Visualize Protein Consequence
+test <- read.csv("vep_results_ncORFs_test.csv", header = F)
+protein_consequence("cYnorep1")
 
 ```
 
-Test -> Trying to download sequence data from Ensembl if fasta file is not available
-
-```{r}
 gene_symbol <- "LINC01128"  # Replace with your gene of interest
 
 # Use the Ensembl BioMart to fetch the gene sequence
@@ -497,7 +700,6 @@ exon_sequences <- getSequence(
   seqType = "gene_exon",
   mart = mart
 )
-```
 
 --Victor Wang 2024/7/16 :D
 
